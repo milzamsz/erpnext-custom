@@ -1,53 +1,58 @@
-version: "3"
-
 services:
   db:
     image: mariadb:11.2
-    healthcheck:
-      test: mysqladmin ping -h localhost --password=admin
-      interval: 1s
-      retries: 15
-    deploy:
-      restart_policy:
-        condition: on-failure
-    command:
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
-      - --skip-character-set-client-handshake
-      - --skip-innodb-read-only-compressed
+    container_name: erpnext_db
     environment:
       MYSQL_ROOT_PASSWORD: admin
       MYSQL_USER: frappe
       MYSQL_PASSWORD: frappe
       MYSQL_DATABASE: frontend
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    ports:
+      - "3307:3306" # Port database diubah
     volumes:
       - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "--password=admin"]
+      interval: 10s
+      retries: 5
+
+  redis-cache:
+    image: redis:6.2-alpine
+    container_name: redis_cache
+    volumes:
+      - redis-cache-data:/data
+
+  redis-queue:
+    image: redis:6.2-alpine
+    container_name: redis_queue
+    volumes:
+      - redis-queue-data:/data
 
   configurator:
     image: 89neuron/erpnext_hrms_payments:v15
-    deploy:
-      restart_policy:
-        condition: none
-    entrypoint:
-      - bash
-      - -c
-    command:
-      - >
-        echo '{
-          "db_host": "db",
-          "db_port": 3306,
-          "db_name": "frontend",
-          "db_user": "frappe",
-          "db_password": "frappe",
-          "redis_cache": "redis://redis-cache:6379",
-          "redis_queue": "redis://redis-queue:6379",
-          "redis_socketio": "redis://redis-queue:6379",
-          "socketio_port": 9000
-        }' > sites/common_site_config.json;
-        ls -1 apps > sites/apps.txt;
+    container_name: configurator
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
+    entrypoint: >
+      bash -c '
+      echo "{
+        \"db_host\": \"db\",
+        \"db_port\": 3306,
+        \"db_name\": \"frontend\",
+        \"db_user\": \"frappe\",
+        \"db_password\": \"frappe\",
+        \"redis_cache\": \"redis://redis-cache:6379\",
+        \"redis_queue\": \"redis://redis-queue:6379\",
+        \"redis_socketio\": \"redis://redis-queue:6379\",
+        \"socketio_port\": 9100
+      }" > /home/frappe/frappe-bench/sites/common_site_config.json;
+      ls -1 apps > /home/frappe/frappe-bench/sites/apps.txt'
     depends_on:
       - db
       - redis-cache
@@ -55,104 +60,36 @@ services:
 
   create-site:
     image: 89neuron/erpnext_hrms_payments:v15
-    deploy:
-      restart_policy:
-        condition: none
+    container_name: create_site
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
-    entrypoint:
-      - bash
-      - -c
-    command:
-      - >
-        wait-for-it -t 300 db:3306;
-        wait-for-it -t 300 redis-cache:6379;
-        wait-for-it -t 300 redis-queue:6379;
-        sleep 10;
-        export start=`date +%s`;
-        until [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".db_host // empty"` ]] && \
-          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_cache // empty"` ]] && \
-          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_queue // empty"` ]];
-        do
-          echo "Waiting for sites/common_site_config.json to be created";
-          sleep 5;
-          if (( `date +%s`-start > 300 )); then
-            echo "could not find sites/common_site_config.json with required keys";
-            exit 1
-          fi
-        done;
-        echo "sites/common_site_config.json found";
-        bench new-site --no-mariadb-socket --mariadb-root-username=root --mariadb-root-password=admin --admin-password=admin --db-name frontend --install-app erpnext --set-default frontend;
-        bench --site frontend install-app hrms;
-        bench --site frontend install-app payments;
+    entrypoint: >
+      bash -c '
+      wait-for-it -t 300 db:3306;
+      wait-for-it -t 300 redis-cache:6379;
+      wait-for-it -t 300 redis-queue:6379;
+      sleep 10;
+      bench new-site --no-mariadb-socket --mariadb-root-username=root --mariadb-root-password=admin --admin-password=admin --db-name frontend --install-app erpnext;
+      bench --site frontend install-app hrms;
+      bench --site frontend install-app payments'
     depends_on:
       - configurator
-      - db
-      - redis-cache
-      - redis-queue
-
-  # Rest of the services remain the same...
-  redis-cache:
-    image: redis:6.2-alpine
-    deploy:
-      restart_policy:
-        condition: on-failure
-    volumes:
-      - redis-cache-data:/data
-
-  redis-queue:
-    image: redis:6.2-alpine
-    deploy:
-      restart_policy:
-        condition: on-failure
-    volumes:
-      - redis-queue-data:/data
 
   backend:
     image: 89neuron/erpnext_hrms_payments:v15
-    deploy:
-      restart_policy:
-        condition: on-failure
+    container_name: backend
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
     depends_on:
       - configurator
-      - db
-      - redis-cache
-      - redis-queue
-
-  frontend:
-    image: 89neuron/erpnext_hrms_payments:v15
-    deploy:
-      restart_policy:
-        condition: on-failure
-    command: 
-      - nginx-entrypoint.sh
     environment:
-      BACKEND: backend:8000
-      FRAPPE_SITE_NAME_HEADER: frontend
-      SOCKETIO: websocket:9000
-      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
-      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
-      UPSTREAM_REAL_IP_RECURSIVE: "off"
-      PROXY_READ_TIMEOUT: 120
-      CLIENT_MAX_BODY_SIZE: 50m
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - logs:/home/frappe/frappe-bench/logs
-    ports:
-      - "8080:8080"
-    depends_on:
-      - backend
-      - websocket
+      SOCKETIO_PORT: 9100
 
   websocket:
     image: 89neuron/erpnext_hrms_payments:v15
-    deploy:
-      restart_policy:
-        condition: on-failure
+    container_name: websocket
     command:
       - node
       - /home/frappe/frappe-bench/apps/frappe/socketio.js
@@ -161,13 +98,25 @@ services:
       - logs:/home/frappe/frappe-bench/logs
     depends_on:
       - backend
-      - redis-queue
+
+  frontend:
+    image: 89neuron/erpnext_hrms_payments:v15
+    container_name: frontend
+    command:
+      - nginx-entrypoint.sh
+    environment:
+      BACKEND: backend:8000
+      FRAPPE_SITE_NAME_HEADER: frontend
+      SOCKETIO: websocket:9100
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    ports:
+      - "9090:8080" # Port frontend diubah
 
   scheduler:
     image: 89neuron/erpnext_hrms_payments:v15
-    deploy:
-      restart_policy:
-        condition: on-failure
+    container_name: scheduler
     command:
       - bench
       - schedule
@@ -176,45 +125,38 @@ services:
       - logs:/home/frappe/frappe-bench/logs
     depends_on:
       - backend
-      - redis-queue
 
   queue-short:
     image: 89neuron/erpnext_hrms_payments:v15
-    deploy:
-      restart_policy:
-        condition: on-failure
+    container_name: queue_short
     command:
       - bench
       - worker
       - --queue
-      - short,default
+      - short
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
     depends_on:
       - backend
-      - redis-queue
 
   queue-long:
     image: 89neuron/erpnext_hrms_payments:v15
-    deploy:
-      restart_policy:
-        condition: on-failure
+    container_name: queue_long
     command:
       - bench
       - worker
       - --queue
-      - long,default,short
+      - long
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
     depends_on:
       - backend
-      - redis-queue
 
 volumes:
   db-data:
-  redis-queue-data:
   redis-cache-data:
+  redis-queue-data:
   sites:
   logs:
